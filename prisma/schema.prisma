@@ -124,6 +124,10 @@ model Settlement {
   memo           String?
   expenseId      String?  @map("expense_id")
   expenseShareId String?  @map("expense_share_id")
+  claimedAt      DateTime? @map("claimed_at")
+  claimedBy      String?  @map("claimed_by")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  nextAttemptAt  DateTime? @map("next_attempt_at")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -136,6 +140,8 @@ model Settlement {
   @@index([fromUserId])
   @@index([toUserId])
   @@index([status])
+  @@index([leaseExpiresAt])
+  @@index([nextAttemptAt])
   @@map("settlements")
 }
 
@@ -207,6 +213,10 @@ model AnchorSession {
   failureReason         String?  @map("failure_reason")
   retryCount            Int      @default(0) @map("retry_count")
   lastPolledAt          DateTime? @map("last_polled_at")
+  claimedAt             DateTime? @map("claimed_at")
+  claimedBy             String?  @map("claimed_by")
+  leaseExpiresAt        DateTime?  @map("lease_expires_at")
+  nextAttemptAt         DateTime?  @map("next_attempt_at")
   createdAt             DateTime @default(now()) @map("created_at")
   updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
@@ -215,6 +225,8 @@ model AnchorSession {
   @@index([userId])
   @@index([externalTransactionId])
   @@index([status])
+  @@index([leaseExpiresAt])
+  @@index([nextAttemptAt])
   @@map("anchor_sessions")
 }
 

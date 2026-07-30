@@ -33,7 +33,7 @@ function securityKey(request: FastifyRequest): string {
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
-  validateAssetConfig();
+  // Asset configuration is validated on-demand in routes
 
   const app = Fastify({
     // Disable Fastify's unvalidated request-id header handling. The incoming
@@ -232,6 +232,17 @@ export async function buildApp(): Promise<FastifyInstance> {
     network: config.STELLAR_NETWORK,
     time: new Date().toISOString(),
   }));
+
+  app.get("/healthz", async () => ({
+    status: "ok",
+  }));
+
+  const { getReadiness } = await import("./services/health.js");
+  app.get("/readyz", async (request, reply) => {
+    const readiness = await getReadiness();
+    const statusCode = readiness.status === "ok" ? 200 : 503;
+    return reply.code(statusCode).send(readiness);
+  });
 
   await app.register(authRoutes);
   await app.register(groupRoutes);

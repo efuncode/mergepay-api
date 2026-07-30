@@ -1,8 +1,10 @@
 import pino from "pino";
+import { randomUUID } from "crypto";
 import { config } from "../config";
 import { prisma } from "../db";
 import { stellar } from "../services/stellar";
 import { audit } from "../services/audit";
+import { AppError } from "../errors";
 import {
   anchorService,
   mapAnchorStatus,
@@ -11,6 +13,7 @@ import {
 } from "../services/anchor";
 import type { PollResult } from "../services/anchor";
 import { runReconciliation, startReconciliation } from "./reconciliation";
+import { classifyJobFailure, retryDelayMs, SETTLEMENT_RETRY_POLICY } from "../services/job-retry";
 
 interface SettlementSubmissionRecord {
   id: string;
@@ -32,8 +35,10 @@ const log = pino({ name: "worker" });
 export const SETTLEMENT_MAX_RETRIES = 3;
 export const RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
+const WORKER_ID = randomUUID();
 const claimedSettlements = new Set<string>();
 const claimedAnchors = new Set<string>();
+let isShuttingDown = false;
 
 class PermanentSettlementError extends Error {
   constructor(message: string) {
@@ -110,21 +115,27 @@ async function recordTransition(
 }
 
 async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<boolean> {
-  if (claimedSettlements.has(settlement.id)) return false;
+  if (isShuttingDown) return false;
+  if (claimedSettlements.has(settlement.id)) return true;
 
-  const model = prisma.settlement as any;
-  if (typeof model.updateMany !== "function") {
-    claimedSettlements.add(settlement.id);
-    return true;
-  }
+  const now = new Date();
+  const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
 
-  const result = await model.updateMany({
+  const result = await prisma.settlement.updateMany({
     where: {
       id: settlement.id,
       status: { in: ["pending", "submitted"] },
-      retryCount: settlement.retryCount,
+      OR: [
+        { leaseExpiresAt: null },
+        { leaseExpiresAt: { lt: now } },
+      ],
     },
-    data: { retryCount: { increment: 1 } },
+    data: {
+      claimedAt: now,
+      claimedBy: WORKER_ID,
+      leaseExpiresAt,
+      retryCount: { increment: 1 },
+    },
   });
 
   if (result.count !== 1) return false;
@@ -135,6 +146,12 @@ async function claimSettlement(settlement: SettlementSubmissionRecord): Promise<
 
 async function releaseSettlementClaim(id: string): Promise<void> {
   claimedSettlements.delete(id);
+  if (!isShuttingDown) {
+    await prisma.settlement.updateMany({
+      where: { id, claimedBy: WORKER_ID },
+      data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+    }).catch(() => {});
+  }
 }
 
 export async function submitSettlement(
@@ -146,7 +163,13 @@ export async function submitSettlement(
   }
 
   try {
-    const hash = await stellar.submitPayment(settlement.transactionXdr);
+    const hash = await stellar.submitPayment(settlement.transactionXdr, {
+      sourcePublicKey: settlement.fromPublicKey,
+      destination: settlement.toPublicKey,
+      asset: { code: settlement.assetCode, issuer: settlement.assetIssuer },
+      amount: settlement.amount,
+      memoCode: settlement.shortCode,
+    });
     log.info({ id: settlement.id, hash }, "settlement submitted successfully");
     return hash;
   } catch (error) {
@@ -159,21 +182,27 @@ export async function submitSettlement(
 
 async function markSettlementFailed(
   settlement: SettlementSubmissionRecord,
-  message: string
+  message: string,
+  terminal: boolean = false
 ): Promise<void> {
   await prisma.settlement.update({
     where: { id: settlement.id },
     data: {
       status: "failed",
+      failureReason: message,
       retryCount: settlement.retryCount,
+      claimedAt: null,
+      claimedBy: null,
+      leaseExpiresAt: null,
     },
   });
   await recordTransition(settlement.id, "settlement_failed", {
     attempt: settlement.retryCount,
     reason: message,
+    terminal,
   });
   log.error(
-    { id: settlement.id, attempt: settlement.retryCount, reason: message },
+    { id: settlement.id, attempt: settlement.retryCount, reason: message, terminal },
     "settlement failed"
   );
 }
@@ -195,28 +224,40 @@ async function processSettlement(settlement: SettlementSubmissionRecord): Promis
             status: "confirmed",
             stellarTxHash: hash,
             retryCount: attempt,
+            claimedAt: null,
+            claimedBy: null,
+            leaseExpiresAt: null,
+            nextAttemptAt: null,
           },
         });
         await recordTransition(settlement.id, "settlement_confirmed", { attempt });
         return;
       } catch (error) {
         const message = safeErrorMessage(error);
-        const permanent = isPermanentSettlementFailure(error) || attempt >= SETTLEMENT_MAX_RETRIES;
+        const failureCategory = classifyJobFailure(error);
+        const permanent = failureCategory === "permanent" || attempt >= SETTLEMENT_MAX_RETRIES;
 
         if (permanent) {
-          await markSettlementFailed(settlement, message);
+          await markSettlementFailed(settlement, message, true);
           return;
         }
 
-        const delay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)];
+        const delay = retryDelayMs(attempt, SETTLEMENT_RETRY_POLICY);
+        const nextAttemptAt = new Date(Date.now() + delay);
         await prisma.settlement.update({
           where: { id: settlement.id },
-          data: { retryCount: attempt },
+          data: { 
+            retryCount: attempt,
+            nextAttemptAt,
+            leaseExpiresAt: new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS),
+          },
         });
         await recordTransition(settlement.id, "settlement_retry_scheduled", {
           attempt,
           nextDelayMs: delay,
+          nextAttemptAt: nextAttemptAt.toISOString(),
           reason: message,
+          failureCategory,
         });
         await sleep(delay);
       }
@@ -288,6 +329,26 @@ export async function reconcileAnchors(): Promise<void> {
 
   for (const session of sessions) {
     if (claimedAnchors.has(session.id)) continue;
+    
+    // Claim the session with a lease
+    const now = new Date();
+    const leaseExpiresAt = new Date(Date.now() + config.WORKER_LEASE_TIMEOUT_MS);
+    const claimResult = await prisma.anchorSession.updateMany({
+      where: {
+        id: session.id,
+        OR: [
+          { leaseExpiresAt: null },
+          { leaseExpiresAt: { lt: now } },
+        ],
+      },
+      data: {
+        claimedAt: now,
+        claimedBy: WORKER_ID,
+        leaseExpiresAt,
+      },
+    });
+
+    if (claimResult.count === 0) continue;
     claimedAnchors.add(session.id);
 
     try {
@@ -299,6 +360,14 @@ export async function reconcileAnchors(): Promise<void> {
         { sessionId: session.id, externalId: session.externalTransactionId, err: message },
         "unexpected error reconciling anchor session"
       );
+    } finally {
+      claimedAnchors.delete(session.id);
+      if (!isShuttingDown) {
+        await prisma.anchorSession.updateMany({
+          where: { id: session.id, claimedBy: WORKER_ID },
+          data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+        }).catch(() => {});
+      }
     }
   }
 }
@@ -465,16 +534,22 @@ export async function expireInvites(): Promise<void> {
 }
 
 export async function processSubmittedSettlements(): Promise<void> {
+  const now = new Date();
   const settlements = await prisma.settlement.findMany({
     where: {
       status: { in: ["pending", "submitted"] },
       transactionXdr: { not: null },
+      OR: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { lte: now } },
+      ],
     },
     include: {
       from: { select: { stellarPublicKey: true } },
       to: { select: { stellarPublicKey: true } },
     },
     take: 50,
+    orderBy: [{ nextAttemptAt: "asc" as const }, { createdAt: "asc" as const }],
   });
 
   for (const row of settlements) {
@@ -483,7 +558,7 @@ export async function processSubmittedSettlements(): Promise<void> {
       shortCode: row.shortCode,
       fromPublicKey: row.from.stellarPublicKey,
       toPublicKey: row.to.stellarPublicKey,
-      amount: row.amount,
+      amount: row.amount.toString(),
       assetCode: row.assetCode,
       assetIssuer: row.assetIssuer,
       transactionXdr: row.transactionXdr,
@@ -517,10 +592,37 @@ export function startWorker(): () => void {
     log.error({ reason: safeErrorMessage(error) }, "initial worker cycle failed");
   });
 
-  return () => {
+  const shutdown = async () => {
+    isShuttingDown = true;
+    log.info("worker shutdown initiated, releasing claims...");
+    
+    // Release all claims
+    const releasePromises = [
+      prisma.settlement.updateMany({
+        where: { claimedBy: WORKER_ID },
+        data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+      }),
+      prisma.anchorSession.updateMany({
+        where: { claimedBy: WORKER_ID },
+        data: { claimedAt: null, claimedBy: null, leaseExpiresAt: null },
+      }),
+    ];
+    
+    await Promise.allSettled(releasePromises);
+    log.info("worker claims released");
+    
     clearInterval(timer);
     reconciliationStop();
   };
+
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+
+  return shutdown;
 }
 
 if (process.env.NODE_ENV !== "test") {
