@@ -1,4 +1,4 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
@@ -7,16 +7,62 @@ import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService, mapAnchorStatus } from "../services/anchor";
 import { applyAnchorSessionTransition } from "../services/anchor-status";
-import { audit } from "../services/audit";
-import { ipKey } from "../services/rate-limit-keys";
+import {
+  applyWithdrawalTransition,
+  mapAnchorStatusToWithdrawalStatus,
+} from "../services/withdrawal-status";
+import { auditTx } from "../services/audit";
+import { rateLimited } from "../lib/rate-limit";
+import { applySep24Callback } from "../services/sep24";
+import {
+  paginationQuerySchema,
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import { serializeAnchorSession } from "../serializers";
+import { getStatusHistory } from "../services/status-history";
 import { validateAsset } from "../services/assets";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
-import { recordStatusTransition } from "../services/status-history";
+import {
+  sep24DepositRequestSchema,
+  sep24InitQuerySchema,
+  sep24WithdrawRequestSchema,
+} from "../validations/sep24";
+import { sep24CallbackSchema } from "../schemas/sep24";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 export default async function anchorRoutes(app: FastifyInstance) {
+  // Every anchor route that reaches an anchor gets an explicit budget so a
+  // client cannot amplify one Mergepay request into unbounded upstream ones.
+  //
+  //  - anchorInit  — deposit/withdraw start and interactive completion. Each
+  //    call fans out to stellar.toml + SEP-10 + SEP-24, so it is the tightest
+  //    policy in the API.
+  //  - anchorPoll  — status reads. Cheaper, but still upstream-amplifying (or,
+  //    for the DB-backed session list, the endpoint clients poll in a loop).
+  //
+  // Both are keyed by the authenticated user, so one caller can never exhaust
+  // another's budget. The webhook is keyed by IP because it is authenticated
+  // by shared secret rather than a session.
+  const initLimit = rateLimited("anchorInit");
+  const pollLimit = rateLimited("anchorPoll");
+
   // -- list anchors (public-ish, but behind auth for consistency) -------------
-  app.get("/anchors", { preHandler: [app.authenticate] }, async () => {
+  app.get(
+    "/anchors",
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "List supported SEP-24 anchors",
+        description: "Returns list of configured SEP-24 anchors and their supported assets.",
+        response: openApiEnvelope("anchors"),
+      },
+    },
+    async () => {
     try {
       const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
       return {
@@ -48,17 +94,30 @@ export default async function anchorRoutes(app: FastifyInstance) {
         ],
       };
     }
-  });
+  }
+  );
 
   // -- start deposit / withdraw -----------------------------------------------
-  async function start(kind: "deposit" | "withdrawal", req: any) {
+  async function start(
+    kind: "deposit" | "withdrawal",
+    req: FastifyRequest,
+    requestSchema = kind === "deposit"
+      ? sep24DepositRequestSchema
+      : sep24WithdrawRequestSchema
+  ) {
     const auth = requireUser(req);
-    const body = z
-      .object({ assetCode: z.string().min(1), anchorName: z.string().optional() })
-      .parse(req.body);
+    // Query first, then body: both are Zod-owned, and both run before the
+    // anchor is contacted, so a malformed request never reaches an upstream
+    // call, the database, or the audit log.
+    sep24InitQuerySchema.parse(req.query ?? {});
+    const body = requestSchema.parse(req.body);
 
-    // Validate that the requested asset is supported.
-    validateAsset(body.assetCode);
+    // Validate that the requested asset is supported. The issuer is part of
+    // the request contract, so it is validated *with* the code rather than
+    // dropped: a caller naming an issuer Mergepay does not issue that asset
+    // under would otherwise get a session created against a different asset
+    // than the one it asked for.
+    validateAsset(body.assetCode, body.assetIssuer);
 
     const t = await anchorService.getToml(config.ANCHOR_HOME_DOMAIN);
     const challenge = await anchorService.getChallenge(
@@ -66,20 +125,24 @@ export default async function anchorRoutes(app: FastifyInstance) {
       auth.stellarPublicKey
     );
 
-    const session = await prisma.anchorSession.create({
-      data: {
+    const session = await prisma.$transaction(async (tx) => {
+      const created = await tx.anchorSession.create({
+        data: {
+          userId: auth.id,
+          anchorName: body.anchorName ?? config.ANCHOR_NAME,
+          kind,
+          assetCode: body.assetCode,
+          status: "incomplete",
+        },
+      });
+      await auditTx(tx, {
         userId: auth.id,
-        anchorName: body.anchorName ?? config.ANCHOR_NAME,
-        kind,
-        assetCode: body.assetCode,
-        status: "incomplete",
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: `anchor.${kind}.start`,
-      entityType: "anchor_session",
-      entityId: session.id,
+        action: "anchor_session.start",
+        entityType: "anchor_session",
+        entityId: created.id,
+        metadata: { kind, assetCode: body.assetCode },
+      });
+      return created;
     });
 
     return {
@@ -88,25 +151,98 @@ export default async function anchorRoutes(app: FastifyInstance) {
     };
   }
 
-  app.post("/anchors/deposit", { preHandler: [app.authenticate] }, (req) =>
-    start("deposit", req)
+  app.post(
+    "/anchors/deposit",
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Initiate SEP-24 interactive deposit",
+        description:
+          "Initiates a SEP-24 interactive deposit session and returns an anchor auth challenge.",
+        // Documented from the same Zod schema the handler parses with, but with
+        // the rules stripped: the handler is the only validator, so a rejection
+        // arrives in the documented VALIDATION_ERROR envelope with `issues`.
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24DepositRequestSchema, { enforce: false }),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              session: { type: "object", additionalProperties: true },
+              challenge: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    (req) => start("deposit", req)
   );
-  app.post("/anchors/withdraw", { preHandler: [app.authenticate] }, (req) =>
-    start("withdrawal", req)
+
+  app.post(
+    "/anchors/withdraw",
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Initiate SEP-24 interactive withdrawal",
+        description:
+          "Initiates a SEP-24 interactive withdrawal session and returns an anchor auth challenge.",
+        querystring: openApiBody(sep24InitQuerySchema, { enforce: false }),
+        body: openApiBody(sep24WithdrawRequestSchema, { enforce: false }),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              session: { type: "object", additionalProperties: true },
+              challenge: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
+    (req) => start("withdrawal", req)
   );
 
   // -- complete (exchange signed challenge for interactive url) ---------------
   app.post(
     "/anchors/sessions/:id/complete",
-    { preHandler: [app.authenticate] },
+    {
+      preHandler: [app.authenticate],
+      ...initLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Complete SEP-24 interactive session",
+        description:
+          "Exchanges signed SEP-10 challenge for an anchor JWT and returns the SEP-24 interactive URL.",
+        params: openApiIdParams(),
+        body: openApiBody(z.object({ signedXdr: z.string().min(1) }).strict()),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "url", "id", "session"],
+            properties: {
+              type: { type: "string", enum: ["interactive"] },
+              url: { type: "string", format: "uri" },
+              id: { type: "string" },
+              session: { type: "object", additionalProperties: true },
+            },
+          },
+        },
+      },
+    },
     async (req) => {
       const auth = requireUser(req);
-      const { id } = z.object({ id: z.string() }).parse(req.params);
-      const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+      const body = z.object({ signedXdr: z.string().min(1) }).strict().parse(req.body);
 
-      const session = await prisma.anchorSession.findUnique({ 
+      const session = await prisma.anchorSession.findUnique({
         where: { id },
-        include: { statusHistory: true },
       });
       if (!session || session.userId !== auth.id) {
         throw Errors.notFound("Anchor session not found");
@@ -136,55 +272,99 @@ export default async function anchorRoutes(app: FastifyInstance) {
         },
       });
 
-      return { session: serializeAnchorSession(updated) };
+      return {
+        type: "interactive" as const,
+        url: interactive.url,
+        id: interactive.id,
+        session: serializeAnchorSession(updated),
+      };
     }
   );
 
   // -- sessions ---------------------------------------------------------------
-  app.get("/anchors/sessions", { preHandler: [app.authenticate] }, async (req) => {
-    const auth = requireUser(req);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
-
-    const sessions = await prisma.anchorSession.findMany({
-      where: {
-        userId: auth.id,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
+  app.get(
+    "/anchors/sessions",
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "List user anchor sessions",
+        description:
+          "Returns a paginated list of SEP-24 interactive sessions for the authenticated user.",
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              sessions: { type: "array", items: { type: "object" } },
+              meta: { type: "object", additionalProperties: true },
             },
-          ],
-        }),
+          },
+        },
       },
-      include: { statusHistory: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
-    });
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
+      const position = requireCursor(cursor);
 
-    const hasMore = sessions.length > limit;
-    const results = hasMore ? sessions.slice(0, limit) : sessions;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
+      const sessions = await prisma.anchorSession.findMany({
+        where: {
+          userId: auth.id,
+          ...cursorFilter(position, order),
+        },
+        orderBy: cursorOrderBy(order),
+        take: takeForPage(limit),
+      });
 
-    return {
-      sessions: results.map(serializeAnchorSession),
-      meta: { nextCursor, hasMore },
-    };
-  });
+      const { items, meta } = buildPage(sessions, limit, order);
+
+      return {
+        sessions: items.map(serializeAnchorSession),
+        meta,
+      };
+    }
+  );
+
+  // -- get session ------------------------------------------------------------
+  app.get(
+    "/anchors/sessions/:id",
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Get anchor session status",
+        description: "Returns details and status for a specific SEP-24 anchor session.",
+        params: openApiIdParams(),
+        response: openApiEnvelope("session"),
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+
+      const session = await prisma.anchorSession.findUnique({
+        where: { id },
+      });
+      if (!session || session.userId !== auth.id) {
+        throw Errors.notFound("Anchor session not found");
+      }
+
+      // The timeline lives in `status_history`, keyed by (entityType, entityId)
+      // rather than by a Prisma relation, so nothing reads it back on the
+      // session query itself. Without this the route answered every poll with
+      // an empty history, which is a claim about the transaction, not an
+      // absence of data.
+      const history = await getStatusHistory({
+        entityType: "anchor_session",
+        entityId: session.id,
+      });
+
+      return { session: serializeAnchorSession({ ...session, statusHistory: history }) };
+    }
+  );
 
   // -- webhook (signed) -------------------------------------------------------
   // Rate limiting here is abuse protection for an unauthenticated-until-
@@ -193,11 +373,23 @@ export default async function anchorRoutes(app: FastifyInstance) {
   app.post(
     "/anchors/webhook",
     {
-      config: {
-        rateLimit: {
-          max: config.SEP24_RATE_LIMIT_MAX,
-          timeWindow: config.RATE_LIMIT_WINDOW_MS,
-          keyGenerator: ipKey("anchor.webhook"),
+      ...rateLimited("anchorWebhook"),
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Anchor status webhook",
+        description: "Receives signed webhook status notifications from SEP-24 anchors.",
+        body: openApiBody(sep24CallbackSchema),
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              received: { type: "boolean" },
+              status: { type: "string" },
+              matched: { type: "integer" },
+              updated: { type: "integer" },
+            },
+          },
         },
       },
     },
@@ -207,40 +399,32 @@ export default async function anchorRoutes(app: FastifyInstance) {
       if (!secret || !constantTimeEqual(secret, config.ANCHOR_WEBHOOK_SECRET)) {
         return reply.code(200).send({ ok: true }); // don't reveal verification result
       }
-      const body = z
-        .object({
-          transaction: z
-            .object({ id: z.string(), status: z.string() })
-            .optional(),
-          id: z.string().optional(),
-          status: z.string().optional(),
-        })
-        .passthrough()
-        .parse(req.body ?? {});
 
-      const externalId = body.transaction?.id ?? body.id;
-      const status = body.transaction?.status ?? body.status;
-      if (externalId && status) {
-        const mappedStatus = mapAnchorStatus(status);
-        await prisma.$transaction(async (tx) => {
-          const sessions = await tx.anchorSession.findMany({
-            where: { externalTransactionId: externalId },
-          });
-          for (const session of sessions) {
-            await tx.anchorSession.update({
-              where: { id: session.id },
-              data: { status: mappedStatus },
-            });
-            await recordStatusTransition({
-              entityType: "anchor_session",
-              entityId: session.id,
-              newStatus: mappedStatus,
-              source: "anchor_webhook",
-            });
-          }
+      const callback = sep24CallbackSchema.parse(req.body ?? {});
+      const result = await applySep24Callback(callback);
+
+      const withdrawal = await prisma.withdrawal.findUnique({
+        where: { anchorTxId: callback.externalTransactionId },
+      });
+      if (withdrawal) {
+        await applyWithdrawalTransition({
+          withdrawalId: withdrawal.id,
+          nextStatus: mapAnchorStatusToWithdrawalStatus(
+            mapAnchorStatus(callback.rawStatus)
+          ),
+          source: "webhook",
         });
       }
-      return reply.code(200).send({ ok: true });
+
+      // 200 regardless of whether a session matched or the transition applied:
+      // anchors retry non-2xx responses, and re-delivering a callback that was
+      // correctly processed as a no-op only amplifies load.
+      return reply.code(200).send({
+        received: true,
+        status: result.status,
+        matched: result.matched,
+        updated: result.updated,
+      });
     }
   );
 }

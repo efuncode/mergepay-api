@@ -5,9 +5,16 @@ const h = vi.hoisted(() => {
   const model = () => ({
     findUnique: vi.fn(),
     findUniqueOrThrow: vi.fn(),
+    findFirst: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
+    findMany: vi.fn(async () => [
+      {
+        payerUserId: "payer_1",
+        shares: [{ userId: "user_1", shareAmount: "1000", status: "pending" }],
+      },
+    ]),
   });
   const prisma: any = {
     expense: model(),
@@ -16,6 +23,7 @@ const h = vi.hoisted(() => {
     group: model(),
     settlement: model(),
     idempotencyKey: model(),
+    statusHistory: model(),
     auditLog: { create: vi.fn() },
     $transaction: vi.fn(async (arg: any) =>
       typeof arg === "function" ? arg(prisma) : Promise.all(arg)
@@ -32,7 +40,9 @@ vi.mock("../src/services/stellar", () => ({
     loadAccount: vi.fn(async () => ({
       exists: true,
       sequence: "1",
-      balances: [],
+      // Funded past the payment, envelope fee, and base reserve so settlement
+      // preflight passes and these tests exercise idempotency alone.
+      balances: [{ assetCode: "XLM", assetIssuer: null, balance: "1000.0000000" }],
       signers: [],
       thresholds: { low: 0, med: 0, high: 0 },
     })),
@@ -143,6 +153,7 @@ describe("POST /expenses/:id/settle — idempotency", () => {
 
     prisma.idempotencyKey.findUnique.mockResolvedValueOnce({
       ...stored,
+      status: "completed",
       responseJson: JSON.stringify(first.json()),
     });
 
@@ -172,11 +183,14 @@ describe("POST /expenses/:id/settle — idempotency", () => {
       method: "POST",
       url: "/expenses/expense_1/settle",
       headers: { ...authHeader(), "idempotency-key": "settle-key-1" },
-      payload: { assetCode: "USDC" },
+      payload: {
+        assetCode: "USDC",
+        assetIssuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      },
     });
 
     expect(res.statusCode).toBe(409);
-    expect(res.json().code).toBe("IDEMPOTENCY_CONFLICT");
+    expect(res.json().error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(prisma.settlement.create).not.toHaveBeenCalled();
   });
 
@@ -203,12 +217,12 @@ describe("POST /expenses/:id/settle — idempotency", () => {
       payload: {},
     });
 
-    // Our attempt did run settlement.create (its writes would roll back with
-    // the real transaction in production), but the client only ever sees a
-    // single logical settlement in the response, never a duplicate-creation
-    // error surfaced as a 500.
+    // The idempotency key is reserved (as "pending") before the operation
+    // runs, so our losing attempt's create() conflicts before ever calling
+    // settlement.create — we fall straight through to the winner's cached
+    // response instead of a duplicate-creation error surfaced as a 500.
     expect(res.statusCode).toBe(200);
-    expect(prisma.settlement.create).toHaveBeenCalledTimes(1);
+    expect(prisma.settlement.create).not.toHaveBeenCalled();
   });
 
   it("rejects settling an already-settled share even with a fresh idempotency key", async () => {

@@ -1,0 +1,10 @@
+-- Superseded no-op.
+--
+-- `20260725000001_add_audit_log` (applied earlier) already adds `audit_logs.group_id`,
+-- its index, and its foreign key to `groups`. This migration re-added the same
+-- column and aborted `prisma migrate deploy` with 42701 `column "group_id" of
+-- relation "audit_logs" already exists`.
+--
+-- Any index schema.prisma still expects from this step is reconciled by
+-- `..._reconcile_schema_drift`. Retained as a documented no-op; safe for the
+-- same ledger reason described in `20260724000000_add_webhooks`.

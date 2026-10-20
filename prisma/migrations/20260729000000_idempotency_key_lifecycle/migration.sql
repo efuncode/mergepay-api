@@ -1,0 +1,10 @@
+-- Superseded no-op.
+--
+-- `20260728000000_scope_idempotency_keys` already added `user_id`, and
+-- `20260801000000_idempotency_key_lifecycle_state` adds `status`, `status_code`,
+-- `expires_at`, and `updated_at` (with `IF NOT EXISTS`), backfills completed
+-- rows, sets `expires_at NOT NULL`, and relaxes `response_json` — the exact work
+-- this migration attempted, done convergently. This step re-added `user_id` and
+-- aborted `prisma migrate deploy` with 42701 `column "user_id" of relation
+-- "idempotency_keys" already exists`. Retained as a documented no-op; safe for
+-- the ledger reason described in `20260724000000_add_webhooks`.

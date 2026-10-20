@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll } from "vitest";
+import { describe, test, expect, beforeAll, beforeEach } from "vitest";
 import { Keypair } from "@stellar/stellar-sdk";
 import fetch from "node-fetch";
 import {
@@ -7,6 +7,7 @@ import {
   createGroup,
   createExpense,
   API_BASE_URL,
+  isLiveServerAvailable,
 } from "./helpers";
 
 const TEST_TIMEOUT = 30000;
@@ -15,13 +16,23 @@ describe("Pagination Integration Flow", () => {
   let adminToken: string;
   let adminKeypair: Keypair;
   let groupId: string;
+  let serverAvailable = false;
 
   beforeAll(async () => {
+    serverAvailable = await isLiveServerAvailable();
+    if (!serverAvailable) return;
+
     adminKeypair = await createTestAccount();
     adminToken = await authenticateUser(adminKeypair);
     const group = await createGroup(adminToken, "Pagination Test Group");
     groupId = group.id;
   }, TEST_TIMEOUT * 2);
+
+  beforeEach((ctx) => {
+    if (!serverAvailable) {
+      ctx.skip();
+    }
+  });
 
   test(
     "generates a large dataset and verifies predictable cursor pagination ordering",
@@ -77,6 +88,12 @@ describe("Pagination Integration Flow", () => {
       expect(page3.meta.hasMore).toBe(false);
       expect(page3.meta.nextCursor).toBeNull();
 
+      // Every page echoes the shared pagination metadata.
+      for (const page of [page1, page2, page3]) {
+        expect(page.meta.limit).toBe(6);
+        expect(page.meta.order).toBe("desc");
+      }
+
       // 5. Verify ordering: check that no items are duplicated or skipped
       const allFetchedIds = new Set([
         ...page1.expenses.map((e: any) => e.id),
@@ -84,6 +101,36 @@ describe("Pagination Integration Flow", () => {
         ...page3.expenses.map((e: any) => e.id),
       ]);
       expect(allFetchedIds.size).toBe(15);
+    },
+    TEST_TIMEOUT
+  );
+
+  test(
+    "bounds page size and rejects malformed pagination input",
+    async () => {
+      const headers = { Authorization: `Bearer ${adminToken}` };
+
+      const overMax = await fetch(
+        `${API_BASE_URL}/groups/${groupId}/expenses?limit=9999`,
+        { headers }
+      );
+      expect(overMax.status).toBe(400);
+      expect((await overMax.json()).error).toBe("VALIDATION_ERROR");
+
+      const badCursor = await fetch(
+        `${API_BASE_URL}/groups/${groupId}/expenses?cursor=not-a-cursor`,
+        { headers }
+      );
+      expect(badCursor.status).toBe(400);
+      expect((await badCursor.json()).error).toBe("INVALID_CURSOR");
+
+      // The default page size is applied and reported, never unbounded.
+      const defaults = await fetch(`${API_BASE_URL}/groups/${groupId}/expenses`, {
+        headers,
+      });
+      const body = await defaults.json();
+      expect(body.meta.limit).toBe(50);
+      expect(body.expenses.length).toBeLessThanOrEqual(50);
     },
     TEST_TIMEOUT
   );

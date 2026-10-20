@@ -17,8 +17,8 @@ export function isValidCorrelationId(value: unknown): value is string {
 }
 
 /** Generate a server-owned correlation ID. */
-export function createCorrelationId(): string {
-  return `req_${randomUUID()}`;
+export function generateCorrelationId(): string {
+  return `req-${randomUUID()}`;
 }
 
 /**
@@ -26,12 +26,14 @@ export function createCorrelationId(): string {
  * Header arrays and all values containing unsafe characters are rejected.
  */
 export function getCorrelationId(value: unknown): string {
-  return isValidCorrelationId(value) ? value : createCorrelationId();
+  return isValidCorrelationId(value) ? value : generateCorrelationId();
 }
 
 /** Resolve a correlation ID for a queued worker job. */
 export function getWorkerCorrelationId(originatingId?: unknown): string {
-  return getCorrelationId(originatingId);
+  return isValidCorrelationId(originatingId)
+    ? originatingId
+    : generateCorrelationId();
 }
 
 /**
@@ -43,6 +45,20 @@ export interface CorrelationContext {
   jobId?: string;
 }
 
+/** Replace any character outside the correlation-ID alphabet with `-`. */
+function sanitizeCorrelationSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9]/g, "-");
+}
+
+/**
+ * Deterministic correlation ID for a background job — same jobType/jobId
+ * always produces the same ID, so retries across worker cycles for the same
+ * job share one correlation ID in logs and audit metadata.
+ */
+export function jobCorrelationId(jobType: string, jobId: string): string {
+  return `job-${sanitizeCorrelationSegment(jobType)}-${sanitizeCorrelationSegment(jobId)}`;
+}
+
 /**
  * Derive a correlation context for a background job. When an originating
  * correlation ID from an API request is not available, the context is
@@ -52,10 +68,12 @@ export interface CorrelationContext {
 export function jobContext(
   jobType: string,
   jobId: string,
-  originatingCorrelationId?: string
+  originatingCorrelationId?: unknown
 ): CorrelationContext {
   return {
-    correlationId: originatingCorrelationId ?? jobCorrelationId(jobType, jobId),
+    correlationId: isValidCorrelationId(originatingCorrelationId)
+      ? originatingCorrelationId
+      : jobCorrelationId(jobType, jobId),
     jobId,
   };
 }

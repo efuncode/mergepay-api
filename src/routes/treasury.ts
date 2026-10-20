@@ -2,34 +2,87 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../db";
+import { stellarAccountIdSchema } from "../lib/stellar-validation";
 import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
+import { requireGroupRole } from "../middleware";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
-import { audit } from "../services/audit";
+import { audit, auditTx } from "../services/audit";
+import { AuditAction } from "../services/audit-actions";
+import { validateAsset, validateAmount } from "../services/assets";
+import { rateLimited } from "../lib/rate-limit";
+import {
+  assertIntentNotExpired,
+  intentExpiry,
+  intentValiditySchema,
+  secondsUntilExpiry,
+} from "../lib/time-bounds";
 import { serializeGroup, serializeTreasuryTx } from "../serializers";
-import { paginationQuerySchema, encodeCursor, decodeCursor } from "../lib/pagination";
-import { validateAmount, validateAsset } from "../services/assets";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  paginationQuerySchema,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
+import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
+import {
+  buildTreasuryPaymentXdr,
+  getTreasuryAccount,
+  getTreasuryAccountSnapshot,
+  getTreasuryMultisigRequirement,
+  hashOfEnvelope,
+  validateTreasurySignedXdr,
+} from "../services/treasury-stellar";
 import {
   validateProposedSignerConfig,
   validateSignerChangeAgainstAccount,
   snapshotToSignerConfig,
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
+import { treasurySignerConfigSchema } from "../validations/treasury";
+import { signedXdrRequestSchema } from "../validations/stellar-transaction";
+import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
+
+const stellarAmountSchema = z.string().min(1);
 
 export default async function treasuryRoutes(app: FastifyInstance) {
   app.addHook("preHandler", app.authenticate);
 
   // -- enable -----------------------------------------------------------------
-  app.post("/groups/:id/treasury/enable", async (req) => {
+  app.post(
+    "/groups/:id/treasury/enable",
+    {
+      // Decides which account holds group funds, and reads live account state
+      // from Horizon on the way — budgeted apart from the routes that move
+      // the money.
+      ...rateLimited("treasuryConfig"),
+      preHandler: requireGroupRole("admin", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Enable group treasury",
+        description:
+          "Enables multi-signature treasury for a group with a designated Stellar public key.",
+        params: openApiIdParams(),
+        body: openApiBody(
+          z.object({
+            publicKey: stellarAccountIdSchema,
+            requiredSigners: z.number().int().min(1).max(20).optional(),
+          })
+        ),
+        response: openApiEnvelope("group"),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
-        publicKey: z.string(),
+        publicKey: stellarAccountIdSchema,
         requiredSigners: z.number().int().min(1).max(20).optional(),
       })
       .parse(req.body);
@@ -48,75 +101,103 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       }
     }
 
-    const group = await prisma.group.update({
-      where: { id },
-      data: {
-        treasuryEnabled: true,
-        treasuryAccountPublicKey: body.publicKey,
-        treasuryRequiredSigners: body.requiredSigners ?? 1,
-      },
-    });
-    await audit({
-      userId: auth.id,
-      action: "treasury.enable",
-      entityType: "group",
-      entityId: id,
+    // The admin check and the update happen in one transaction so a
+    // concurrent demotion/removal of `auth.id` can't bypass authorization.
+    const group = await prisma.$transaction(async (tx) => {
+      await requireAdmin(id, auth.id, tx);
+      // Read inside the transaction so the audit entry records the
+      // configuration this call actually replaced.
+      const existing = await tx.group.findUnique({ where: { id } });
+      const updated = await tx.group.update({
+        where: { id },
+        data: {
+          treasuryEnabled: true,
+          treasuryAccountPublicKey: body.publicKey,
+          treasuryRequiredSigners: body.requiredSigners ?? 1,
+        },
+      });
+      await auditTx(tx, {
+        userId: auth.id,
+        groupId: id,
+        actorPublicKey: auth.stellarPublicKey,
+        action: AuditAction.TREASURY_ENABLE,
+        entityType: "group",
+        entityId: id,
+        outcome: "success",
+        // The multisig configuration is the security-relevant part of this
+        // change: the signing threshold decides how many approvals it takes
+        // to move funds, so an audit needs to see what it was set to and what
+        // it replaced, not merely that the treasury was touched.
+        metadata: {
+          treasuryAccountPublicKey: body.publicKey,
+          previousRequiredSigners: existing?.treasuryRequiredSigners ?? null,
+          requiredSigners: body.requiredSigners ?? 1,
+          previouslyEnabled: existing?.treasuryEnabled ?? false,
+        },
+      });
+      return updated;
     });
     return { group: serializeGroup(group) };
   });
 
   // -- info -------------------------------------------------------------------
-  app.get("/groups/:id/treasury", async (req) => {
-    const auth = requireUser(req);
+  app.get(
+    "/groups/:id/treasury",
+    {
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Get group treasury status",
+        description: "Returns treasury account public key, balances, signers, and thresholds.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
+    const view = await getTreasuryAccount(group.treasuryAccountPublicKey);
     return {
-      publicKey: group.treasuryAccountPublicKey,
-      balances: snapshot.balances.map((b) => ({
-        assetCode: b.assetCode,
-        assetIssuer: b.assetIssuer,
-        balance: b.balance,
-      })),
-      signers: snapshot.signers,
-      thresholds: snapshot.thresholds,
+      publicKey: view.publicKey,
+      balances: view.balances,
+      signers: view.signers,
+      thresholds: view.thresholds,
     };
   });
 
   // -- validate signer config -------------------------------------------------
-  app.post("/groups/:id/treasury/validate-signers", async (req) => {
+  app.post(
+    "/groups/:id/treasury/validate-signers",
+    {
+      // One Horizon account read per call, so this is upstream budget an
+      // admin session can spend without changing anything.
+      ...rateLimited("treasuryConfig"),
+      preHandler: requireGroupRole("admin", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Validate treasury signer configuration",
+        description:
+          "Validates proposed signer set and threshold changes against the Stellar network state.",
+        params: openApiIdParams(),
+        body: openApiBody(treasurySignerConfigSchema),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
-    
-    const body = z
-      .object({
-        signers: z.array(
-          z.object({
-            publicKey: z.string(),
-            weight: z.number().int().min(0).max(255),
-          })
-        ),
-        thresholds: z.object({
-          low: z.number().int().min(0).max(255),
-          med: z.number().int().min(0).max(255),
-          high: z.number().int().min(0).max(255),
-        }),
-      })
-      .parse(req.body);
+
+    const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    const snapshot = await stellar.loadAccount(group.treasuryAccountPublicKey);
-    
+    const snapshot = await getTreasuryAccountSnapshot(group.treasuryAccountPublicKey);
+
     const proposedConfig: ProposedSignerConfig = {
       signers: body.signers,
       thresholds: body.thresholds,
@@ -126,7 +207,9 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     
     await audit({
       userId: auth.id,
-      action: "treasury.signer_validation",
+      groupId: id,
+      actorPublicKey: auth.stellarPublicKey,
+      action: AuditAction.TREASURY_SIGNER_VALIDATION,
       entityType: "group",
       entityId: id,
       metadata: {
@@ -142,15 +225,29 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- deposit ----------------------------------------------------------------
-  app.post("/groups/:id/treasury/deposit", async (req) => {
+  app.post(
+    "/groups/:id/treasury/deposit",
+    {
+      ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Initiate treasury deposit",
+        description: "Creates an unsigned deposit intent transaction for a group treasury.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
+        // A client may ask for a shorter signing window; the server clock still
+        // decides the deadline.
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -170,9 +267,29 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
-        const ttx = await prisma.treasuryTransaction.create({
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+
+        const account = await stellar.loadAccount(auth.stellarPublicKey);
+        if (!account.exists) {
+          throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
+        }
+        const xdr = buildTreasuryPaymentXdr({
+          sourcePublicKey: auth.stellarPublicKey,
+          sourceSequence: account.sequence,
+          destination: treasuryKey,
+          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
+          amount: body.amount,
+          memoCode: code,
+          validitySeconds,
+        });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = hashOfEnvelope(xdr);
+
+        const ttx = await tx.treasuryTransaction.create({
           data: {
             shortCode: code,
             groupId: id,
@@ -184,26 +301,36 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             destination: treasuryKey,
             status: "pending",
             memo: memoText(code),
+            expiresAt,
+            intendedTxHash,
           },
           include: { user: true },
         });
 
-        const account = await stellar.loadAccount(auth.stellarPublicKey);
-        if (!account.exists) {
-          throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
-        }
-        const xdr = stellar.buildPayment({
-          sourcePublicKey: auth.stellarPublicKey,
-          sourceSequence: account.sequence,
-          destination: treasuryKey,
-          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-          amount: body.amount,
-          memoCode: code,
+        // The audit row is written through the same transaction as the state
+        // change (issue #367): a best-effort write here would survive a
+        // rollback and orphan an entry for a deposit that never happened.
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          actorPublicKey: auth.stellarPublicKey,
+          action: AuditAction.TREASURY_DEPOSIT_CREATE,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: treasuryKey,
+          },
         });
+
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
           xdr,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
           networkPassphrase: config.networkPassphrase,
         };
       },
@@ -211,16 +338,28 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- withdraw ---------------------------------------------------------------
-  app.post("/groups/:id/treasury/withdraw", async (req) => {
+  app.post(
+    "/groups/:id/treasury/withdraw",
+    {
+      ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Propose treasury withdrawal",
+        description: "Creates a withdrawal proposal requiring multi-signature approval.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
     const body = z
       .object({
-        amount: z.string().min(1),
-        assetCode: z.string().min(1),
+        amount: stellarAmountSchema,
+        assetCode: z.string().min(1).max(12),
         assetIssuer: z.string().nullable().optional(),
         destination: z.string(),
+        validitySeconds: intentValiditySchema.optional(),
       })
       .parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
@@ -229,7 +368,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     if (!StrKey.isValidEd25519PublicKey(body.destination)) {
-      throw Errors.badRequest("invalid_destination", "Invalid destination public key");
+      throw Errors.badRequest("invalid_destination", "Not a valid Stellar public key");
     }
 
     const group = await prisma.group.findUnique({ where: { id } });
@@ -246,9 +385,29 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       key: idempotencyKey,
       resourceId: id,
       payload: body,
-      operation: async () => {
+      operation: async (tx) => {
         const code = shortCode();
-        const ttx = await prisma.treasuryTransaction.create({
+        const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
+
+        const account = await stellar.loadAccount(treasuryKey);
+        if (!account.exists) {
+          throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
+        }
+        const xdr = buildTreasuryPaymentXdr({
+          sourcePublicKey: treasuryKey,
+          sourceSequence: account.sequence,
+          destination: body.destination,
+          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
+          amount: body.amount,
+          memoCode: code,
+          validitySeconds,
+        });
+
+        // Compute the transaction hash so the confirm endpoint can validate
+        // the submitted signed XDR is for this exact intent.
+        const intendedTxHash = hashOfEnvelope(xdr);
+
+        const ttx = await tx.treasuryTransaction.create({
           data: {
             shortCode: code,
             groupId: id,
@@ -260,25 +419,35 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             destination: body.destination,
             status: requiresMulti ? "awaiting_signatures" : "pending",
             memo: memoText(code),
+            expiresAt,
+            intendedTxHash,
           },
           include: { user: true },
         });
 
-        const account = await stellar.loadAccount(treasuryKey);
-        if (!account.exists) {
-          throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
-        }
-        const xdr = stellar.buildPayment({
-          sourcePublicKey: treasuryKey,
-          sourceSequence: account.sequence,
-          destination: body.destination,
-          asset: { code: body.assetCode, issuer: body.assetIssuer ?? null },
-          amount: body.amount,
-          memoCode: code,
+        // The audit row is written through the same transaction as the state
+        // change (issue #367): a best-effort write here would survive a
+        // rollback and orphan an entry for a withdrawal that never happened.
+        await auditTx(tx, {
+          userId: auth.id,
+          groupId: id,
+          actorPublicKey: auth.stellarPublicKey,
+          action: AuditAction.TREASURY_WITHDRAW_CREATE,
+          entityType: "treasury_transaction",
+          entityId: ttx.id,
+          metadata: {
+            amount: body.amount,
+            assetCode: body.assetCode,
+            assetIssuer: body.assetIssuer ?? null,
+            destination: body.destination,
+          },
         });
+
 
         return {
           treasuryTransaction: serializeTreasuryTx(ttx),
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: secondsUntilExpiry(expiresAt),
           xdr,
           networkPassphrase: config.networkPassphrase,
         };
@@ -287,114 +456,133 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- confirm treasury tx ----------------------------------------------------
-  app.post("/treasury-transactions/:id/confirm", async (req) => {
+  // Submitting a signed treasury envelope validates it and pushes it to
+  // Horizon, so it gets its own budget rather than sharing one with the
+  // treasury read routes — or with settlement submission.
+  app.post(
+    "/treasury-transactions/:id/confirm",
+    {
+      ...rateLimited("treasurySubmit"),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Confirm treasury transaction",
+        description: "Submits signatures and confirms execution of a treasury transaction.",
+        params: openApiIdParams(),
+        body: openApiBody(signedXdrRequestSchema),
+      },
+    },
+    async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const body = signedXdrRequestSchema.parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });
     if (!ttx) throw Errors.notFound("Treasury transaction not found");
 
+    // Authorize from the transaction's persisted group before reading treasury
+    // configuration or accepting any signed envelope. Deposits are additionally
+    // owned by their creator; withdrawals require an administrator.
+    if (ttx.direction === "deposit") {
+      await requireMembership(ttx.groupId, auth.id);
+      if (ttx.userId !== auth.id) {
+        throw Errors.forbidden("Only the depositor can confirm this deposit");
+      }
+      await requireMembership(ttx.groupId, auth.id);
+    } else {
+      await requireAdmin(ttx.groupId, auth.id);
+    }
     const group = await prisma.group.findUnique({ where: { id: ttx.groupId } });
     if (!group?.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
 
-    if (ttx.direction === "deposit") {
-      if (ttx.userId !== auth.id) {
-        throw Errors.forbidden("Only the depositor can confirm this deposit");
-      }
-    } else {
-      await requireAdmin(ttx.groupId, auth.id);
-    }
     if (ttx.status === "confirmed") {
       return { treasuryTransaction: serializeTreasuryTx(ttx) };
     }
 
-    const source =
-      ttx.direction === "deposit"
-        ? auth.stellarPublicKey
-        : group.treasuryAccountPublicKey;
-    const destination =
-      ttx.direction === "deposit"
-        ? group.treasuryAccountPublicKey
-        : ttx.destination!;
+    // Checked after authorization (so a stranger learns nothing from the
+    // difference) but before anything is sent upstream: an expired intent must
+    // never be submitted to Horizon.
+    assertIntentNotExpired(ttx.expiresAt, "treasury transaction");
 
-    let hash: string;
-    try {
-      hash = await stellar.submitPayment(body.signedXdr, {
-        sourcePublicKey: source,
-        destination,
-        asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-        amount: ttx.amount.toString(),
-        memoCode: ttx.shortCode,
-      });
-    } catch (e) {
-      await prisma.treasuryTransaction.update({
-        where: { id },
-        data: { status: "failed" },
-      });
-      if (e instanceof AppError) throw e;
-      throw Errors.upstream("Transaction submission failed");
+    const treasuryAccountPublicKey = group.treasuryAccountPublicKey;
+    const source = ttx.direction === "deposit" ? auth.stellarPublicKey : treasuryAccountPublicKey;
+    const destination = ttx.direction === "deposit" ? treasuryAccountPublicKey : ttx.destination!;
+
+    // A withdrawal spends from the shared treasury account, so it must carry
+    // signatures from the account's own configured co-signers (checked
+    // against the threshold on file), not just a single valid signature.
+    let multisig: { signers: string[]; threshold: number } | null = null;
+    if (ttx.direction === "withdrawal") {
+      multisig = await getTreasuryMultisigRequirement(
+        treasuryAccountPublicKey,
+        group.treasuryRequiredSigners ?? 1
+      );
     }
 
-    const updated = await prisma.treasuryTransaction.update({
-      where: { id },
-      data: { status: "confirmed", stellarTxHash: hash },
-      include: { user: true },
-    });
-    await audit({
+    return runIdempotent({
       userId: auth.id,
       scope: "treasury.confirm",
       key: idempotencyKey,
       resourceId: id,
       payload: body,
       operation: async (tx) => {
-        const ttx = await tx.treasuryTransaction.findUnique({ where: { id } });
-        if (!ttx) throw Errors.notFound("Treasury transaction not found");
-
-        const group = await tx.group.findUnique({ where: { id: ttx.groupId } });
-        if (!group?.treasuryAccountPublicKey) {
-          throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
+        const fresh = await tx.treasuryTransaction.findUnique({ where: { id } });
+        if (!fresh) throw Errors.notFound("Treasury transaction not found");
+        if (fresh.status === "confirmed") {
+          return { treasuryTransaction: serializeTreasuryTx(fresh) };
         }
 
-        if (ttx.direction === "deposit") {
-          if (ttx.userId !== auth.id) {
-            throw Errors.forbidden("Only the depositor can confirm this deposit");
-          }
-        } else {
-          await requireAdmin(ttx.groupId, auth.id);
-        }
-
-        if (ttx.status === "confirmed") {
-          return { treasuryTransaction: serializeTreasuryTx(ttx) };
-        }
-
-        const source =
-          ttx.direction === "deposit"
-            ? auth.stellarPublicKey
-            : group.treasuryAccountPublicKey;
-        const destination =
-          ttx.direction === "deposit"
-            ? group.treasuryAccountPublicKey
-            : ttx.destination!;
-
+        // Validate the submitted signed XDR is for the exact intended
+        // transaction. This prevents a signer from submitting a signature
+        // for a modified (attacker-changed) transaction.
         let hash: string;
         try {
-          hash = await stellar.submitPayment(body.signedXdr, {
+          const expected = {
             sourcePublicKey: source,
             destination,
-            asset: { code: ttx.assetCode, issuer: ttx.assetIssuer },
-            amount: ttx.amount.toString(),
-            memoCode: ttx.shortCode,
-          });
+            asset: { code: fresh.assetCode, issuer: fresh.assetIssuer },
+            amount: fresh.amount.toString(),
+            memoCode: fresh.shortCode,
+            expiresAt: fresh.expiresAt,
+            resource: "treasury transaction",
+          };
+          if (fresh.intendedTxHash) {
+            const validation = validateTreasurySignedXdr(body.signedXdr, {
+              ...expected,
+              skipSourceSignatureCheck: Boolean(multisig),
+            });
+            if (validation.tx.hash().toString("hex") !== fresh.intendedTxHash) {
+              throw Errors.badRequest(
+                "xdr_mismatch",
+                "Submitted signed XDR does not match the intended transaction"
+              );
+            }
+          }
+          hash = multisig
+            ? await stellar.submitMultisigPayment(body.signedXdr, expected, multisig)
+            : await stellar.submitPayment(body.signedXdr, expected);
         } catch (e) {
           await tx.treasuryTransaction.update({
             where: { id },
             data: { status: "failed" },
           });
-          throw e;
+          await auditTx(tx, {
+            userId: auth.id,
+            groupId: fresh.groupId,
+            actorPublicKey: auth.stellarPublicKey,
+            action: AuditAction.TREASURY_CONFIRM_FAILED,
+            entityType: "treasury_transaction",
+            entityId: id,
+            outcome: "failure",
+            metadata: {
+              direction: fresh.direction,
+              reason: e instanceof Error ? e.message : String(e),
+            },
+          });
+          if (e instanceof AppError) throw e;
+          throw Errors.upstream("Transaction submission failed");
         }
 
         const updated = await tx.treasuryTransaction.update({
@@ -402,12 +590,14 @@ export default async function treasuryRoutes(app: FastifyInstance) {
           data: { status: "confirmed", stellarTxHash: hash },
           include: { user: true },
         });
-        await audit({
+        await auditTx(tx, {
           userId: auth.id,
-          action: "treasury.confirm",
+          groupId: fresh.groupId,
+          actorPublicKey: auth.stellarPublicKey,
+          action: AuditAction.TREASURY_CONFIRM,
           entityType: "treasury_transaction",
           entityId: id,
-          metadata: { hash, direction: ttx.direction },
+          metadata: { hash, direction: fresh.direction },
         });
         return { treasuryTransaction: serializeTreasuryTx(updated) };
       },
@@ -415,50 +605,31 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   });
 
   // -- history ----------------------------------------------------------------
-  app.get("/groups/:id/treasury/history", async (req) => {
-    const auth = requireUser(req);
-    const { id: groupId } = z.object({ id: z.string() }).parse(req.params);
-    const { cursor, limit } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
+  app.get(
+    "/groups/:id/treasury/history",
+    {
+      preHandler: requireGroupRole("member", { param: "id" }),
+      schema: {
+        tags: ["Treasury"],
+        summary: "Get treasury transaction history",
+        description: "Returns paginated transaction history for a group treasury.",
+        params: openApiIdParams(),
+      },
+    },
+    async (req) => {
+    const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+    const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
 
-    let decodedCursor = null;
-    if (cursor) {
-      decodedCursor = decodeCursor(cursor);
-      if (!decodedCursor) {
-        throw Errors.badRequest("invalid_cursor", "The provided cursor is invalid");
-      }
-    }
+    const position = requireCursor(cursor);
 
     const transactions = await prisma.treasuryTransaction.findMany({
-      where: {
-        groupId,
-        ...(decodedCursor && {
-          OR: [
-            { createdAt: { lt: decodedCursor.createdAt } },
-            {
-              createdAt: decodedCursor.createdAt,
-              id: { lt: decodedCursor.id },
-            },
-          ],
-        }),
-      },
+      where: { groupId, ...cursorFilter(position, order) },
       include: { user: true },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      take: limit + 1,
+      orderBy: cursorOrderBy(order),
+      take: takeForPage(limit),
     });
 
-    const hasMore = transactions.length > limit;
-    const results = hasMore ? transactions.slice(0, limit) : transactions;
-    const nextCursor = hasMore
-      ? encodeCursor(
-          results[results.length - 1].createdAt,
-          results[results.length - 1].id
-        )
-      : null;
-
-    return {
-      transactions: results.map(serializeTreasuryTx),
-      meta: { nextCursor, hasMore },
-    };
+    const { items, meta } = buildPage(transactions, limit, order);
+    return { transactions: items.map(serializeTreasuryTx), meta };
   });
 }
