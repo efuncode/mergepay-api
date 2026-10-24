@@ -80,6 +80,47 @@ Expected: a JSON response with `status` and both dependency checks reporting liv
 - [ ] New endpoints validated with Zod + permission checks
 - [ ] Contract changes mirrored in `mergepay-web`
 - [ ] No secrets committed; user private keys never handled
+- [ ] **Audit logs written for all state-changing endpoints**
+
+## CI Prisma Checks
+
+This section documents the Prisma validation and migration drift checks added in PR #940.
+
+### `prisma:validate`
+
+Run via `npm run prisma:validate`. This command:
+- Validates the Prisma schema against the connected database
+- Ensures the schema is consistent with the database model
+- Fails if there are drift issues between the schema and the database
+
+### `prisma:status`
+
+Run via `npm run prisma:status`. This command:
+- Shows the current migration status
+- Indicates which migrations have been applied
+- Helps identify pending migrations
+
+### `prisma:check-drift`
+
+Run via `npm run prisma:check-drift`. This command:
+- Checks for drift between the Prisma schema and the database
+- Reports any differences that need to be addressed
+- Ensures the database schema matches the expected model
+
+### Local reproduction
+
+- `npm run prisma:validate` — validates the Prisma schema
+- `npm run prisma:status` — shows migration status
+- `npm run prisma:check-drift` — checks for drift
+
+### Contribution guidelines for audit logging
+
+- **Write audit logs for all state-changing actions** — every group creation, expense settlement, treasury update, and member management action must produce an audit log entry
+- Use the centralized `logAction` or `logActionTx` helpers from `src/services/audit.ts`
+- `logAction` — best-effort write that never breaks the operation; logs to `audit_logs` table and mirrors to the structured Pino auditor
+- `logActionTx` — atomic write inside a caller-managed transaction; audit row commits/rolls back with the mutation
+- Never log sensitive material (private keys, bearer tokens, signed XDRs) in audit metadata — the `sanitizeAuditMetadata` function strips these automatically
+- Asynchronous logging must not block HTTP response delivery — audit writes are best-effort and errors are swallowed
 
 ## Tests
 
@@ -162,3 +203,25 @@ The following environment variables can be used to configure integration tests:
 - If tests fail with network errors, check that the testnet is accessible.
 - If friendbot funding fails, the tests include retry logic with backoff.
 - Ensure the backend server is fully started before running integration tests.
+
+### CI Prisma Checks
+
+CI validates the Prisma schema and migration state on every PR:
+
+- **`build-test` job** — runs `npm run prisma:validate` after `prisma:generate`. A schema syntax error or invalid relation fails the job before the TypeScript build or test suite runs.
+- **`integration` job** — runs `npm run prisma:validate` before the integration suite for consistency.
+- **`migration` job** — runs the full migration pipeline:
+  1. `npm run prisma:validate` — schema must be syntactically valid
+  2. `npx prisma migrate deploy` — the entire committed migration history must deploy cleanly to a fresh Postgres database
+  3. `npm run prisma:status` — migration status must be consistent
+  4. `npm run prisma:check-drift` — the deployed database state must equal `prisma/schema.prisma` (exit code 0); any diff means migrations drifted from the schema and must be reconciled before merge
+
+Locally, run the same checks before pushing:
+
+```bash
+npm run prisma:validate      # schema syntax
+npm run prisma:status        # migration status (needs DATABASE_URL)
+npm run prisma:check-drift   # schema vs. deployed database (needs DATABASE_URL)
+```
+
+### Final Stage
